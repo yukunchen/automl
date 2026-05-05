@@ -28,6 +28,7 @@ import student
 
 DEPLOY_METRICS_PATH = Path("metrics_deploy.json")
 ON_DEVICE_EVAL_IMAGES = 200  # AGENT: bump up if AI Hub budget allows
+CALIBRATION_IMAGES = 64      # use real val images for PTQ calibration
 
 
 # ----------------------------------------------------------------------------
@@ -169,10 +170,31 @@ def main() -> None:
     host_model = build_host_student()
     traced, input_shape = trace_for_npu(host_model, student.INPUT_SIZE)
 
-    print("submitting compile + profile (INT8)...", flush=True)
+    # Hypothesis: AI Hub default calibration uses random data; real val images
+    # give better activation range estimates for the detection head.
+    # Pull the LAST CALIBRATION_IMAGES of val (disjoint from on-device eval set
+    # which uses the FIRST ON_DEVICE_EVAL_IMAGES).
+    print(f"building calibration set ({CALIBRATION_IMAGES} val images)...", flush=True)
+    val_ds_for_calib = prepare.load_coco_val()
+    calib_arrays = []
+    n_total = len(val_ds_for_calib)
+    for i in range(n_total - CALIBRATION_IMAGES, n_total):
+        img, _t, _id = val_ds_for_calib[i]
+        resized = torch.nn.functional.interpolate(
+            img.unsqueeze(0), size=(student.INPUT_SIZE, student.INPUT_SIZE),
+            mode="bilinear", align_corners=False,
+        ).squeeze(0)
+        calib_arrays.append(resized.numpy().astype(np.float32)[np.newaxis, ...])
+    calibration_data = {"image": calib_arrays}
+
+    # quantize=True so prepare.py wires calibration_data into the compile job.
+    # extra_options appends --quantize_full_type w8a16 after the default int8;
+    # the AI Hub argparser takes the last occurrence.
+    print("submitting compile + profile (w8a16, real-data calibration)...", flush=True)
     hub_metrics = prepare.submit_aihub_profile(
         traced, input_shape,
-        quantize=True, calibration_data=None, extra_options="",
+        quantize=True, calibration_data=calibration_data,
+        extra_options="--quantize_full_type w8a16",
     )
 
     if not hub_metrics.get("qnn_export_ok"):

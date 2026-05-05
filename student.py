@@ -38,8 +38,8 @@ TRAIN_METRICS_PATH = Path("metrics_train.json")
 INPUT_SIZE = 320
 
 # AGENT: tune.
-NUM_TRAIN_IMAGES = 2000      # how many train images to use this run
-NUM_EPOCHS = 1
+NUM_TRAIN_IMAGES = 5000
+NUM_EPOCHS = 0               # PROBE: pretrained ssdlite is already 21.3 mAP — does ANY training help?
 BATCH_SIZE = 8
 LR = 5e-4
 EVAL_MAX_IMAGES = 500        # validate on a subset for speed; agent can raise
@@ -60,7 +60,7 @@ def build_student() -> torch.nn.Module:
 # ----------------------------------------------------------------------------
 
 @torch.no_grad()
-def teacher_pseudo_labels(teacher: torch.nn.Module, images, score_thresh: float = 0.5):
+def teacher_pseudo_labels(teacher: torch.nn.Module, images, score_thresh: float = 0.3):
     """Run teacher in eval mode and convert outputs to detection target format.
 
     AGENT: replace this with a real distillation loss (logit KD, feature KD, etc.).

@@ -1,2 +1,7 @@
 commit	score	fp32_map	q_map	lat_ms	size_mb	mem_mb	qnn_ok	cpu_fb	status	description
 5265863	0.0869	0.1735	0.0869	0.97	6.84	10.2	true	0	keep	baseline: SSDLite320-MobileNetV3-Large + pseudo-label distill 2000 imgs/1 epoch + INT8 PTQ
+exp1	0.1045	0.1776	0.1045	1.66	6.97	8.8	true	0	keep	w8a16 quant: hold activations 16-bit to recover regression head (+20%)
+exp2	0.1179	0.1727	0.1179	1.67	6.97	9.7	true	0	keep	bump training: 2000->5000 imgs / 1->2 epochs — quant_map +13% via more stable activations
+exp3	0.1370	0.1740	0.1370	1.66	6.97	9.4	true	0	keep	real-image PTQ calibration (64 val imgs) closes another 16% of quant gap
+exp4	0.1354	0.1661	0.1354	1.67	6.97	10.0	true	0	discard	lower teacher pseudo-label threshold 0.5->0.3: too much teacher noise hurts fp32
+exp5	0.1260	0.1710	0.1260	1.66	6.97	10.4	true	0	discard	mix GT + teacher pseudo-labels: duplicate signal hurts quant
