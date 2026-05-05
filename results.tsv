@@ -1,0 +1,2 @@
+commit	score	fp32_map	q_map	lat_ms	size_mb	mem_mb	qnn_ok	cpu_fb	status	description
+5265863	0.0869	0.1735	0.0869	0.97	6.84	10.2	true	0	keep	baseline: SSDLite320-MobileNetV3-Large + pseudo-label distill 2000 imgs/1 epoch + INT8 PTQ
