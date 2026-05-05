@@ -22,7 +22,7 @@ PY=$(command -v python || command -v python3)
 echo "using python: $PY"
 
 echo "[1/6] sanity-checking GPU + driver"
-nvidia-smi | head -n 5
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 "$PY" -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 
 echo "[2/6] BF16 + CUDA matmul smoke test"
