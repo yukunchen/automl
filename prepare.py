@@ -98,14 +98,28 @@ def _unzip(zip_path: Path, dest_dir: Path, marker_subdir: str) -> None:
         zf.extractall(dest_dir)
 
 
+_AUTODL_COCO = Path("/root/autodl-pub/COCO2017")
+_AUTODL_ZIPS = {
+    "val2017": _AUTODL_COCO / "val2017.zip",
+    "train2017": _AUTODL_COCO / "train2017.zip",
+    "annotations": _AUTODL_COCO / "annotations_trainval2017.zip",
+}
+
+
 def download_coco(splits: Iterable[str] = ("val2017", "annotations")) -> None:
-    """Idempotent."""
+    """Idempotent. Uses AutoDL's preloaded /root/autodl-pub/COCO2017 zips when
+    available (instant), else downloads from cocodataset.org."""
     COCO_DIR.mkdir(parents=True, exist_ok=True)
     zips_dir = COCO_DIR / "_zips"
     zips_dir.mkdir(exist_ok=True)
     for split in splits:
-        url = _COCO_URLS[split]
-        _download(url, zips_dir / Path(url).name)
+        autodl_zip = _AUTODL_ZIPS.get(split)
+        target = zips_dir / Path(_COCO_URLS[split]).name
+        if autodl_zip and autodl_zip.exists() and not target.exists():
+            print(f"using AutoDL preloaded {autodl_zip} -> symlink", flush=True)
+            target.symlink_to(autodl_zip)
+        else:
+            _download(_COCO_URLS[split], target)
     for split in splits:
         zpath = zips_dir / Path(_COCO_URLS[split]).name
         marker = "annotations" if split == "annotations" else split

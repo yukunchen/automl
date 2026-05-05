@@ -62,12 +62,15 @@ gets attributed to the experiment that introduced it.
 
 ## Experimentation
 
-Each experiment runs end-to-end:
+Each experiment runs end-to-end via:
 
 ```
-uv run student.py > run.log 2>&1     # train & distill (typically 30-90 min)
-uv run deploy.py  >> run.log 2>&1    # quantize, export to QNN, benchmark on AI Hub
+bash run_experiment.sh "<short description of what changed>"
 ```
+
+This handles venv switching (`.venv-train` for training, `.venv-deploy` for
+AI Hub), writes everything to `run.log`, and prints a `RESULTS_ROW` line you
+append to `results.tsv` (after deciding keep/discard/crash).
 
 `deploy.py` submits the model to **Qualcomm AI Hub** which runs it on a real
 SD8 Gen 1 device and returns latency + per-layer profile. No physical
@@ -172,16 +175,17 @@ LOOP FOREVER:
 1. Check git state.
 2. Form a hypothesis. Modify `student.py` and/or `deploy.py`.
 3. `git commit -am "<short description>"`.
-4. Run training: `uv run student.py > run.log 2>&1`.
-5. If training crashed (`grep fp32_map run.log` empty), `tail -n 80 run.log`,
-   decide: fix-and-rerun if trivial, else log `crash` and revert.
-6. Run deployment: `uv run deploy.py >> run.log 2>&1`.
-7. Extract metrics with the grep above.
-8. If `score: -inf`, identify the failing constraint. Don't keep it.
-9. Append to `results.tsv`.
-10. If quantized_map improved over the current best (and constraints pass),
-    advance the branch (keep the commit).
-11. Else `git reset --hard HEAD~1` back to the last `keep`.
+4. `bash run_experiment.sh "<short description>"` — runs train+deploy,
+   produces `run.log` and a `RESULTS_ROW` line on stdout.
+5. If the script printed a `crash` row, `tail -n 80 run.log`, decide:
+   fix-and-rerun if trivial, else log `crash` in `results.tsv` and revert.
+6. Read the `RESULTS_ROW` line. Compare quantized_map (column 4) to the
+   current best in `results.tsv`.
+7. Edit the `RESULTS_ROW` to set status: `keep` if improved (and no
+   constraint violation), `discard` if not, `crash` if failed.
+8. Append the edited row to `results.tsv`.
+9. If `keep`, advance the branch (the commit stays). Else
+   `git reset --hard HEAD~1` back to the last keep commit.
 
 **Important**: the metric you optimize is **quantized_map under all hard
 constraints**, not fp32 mAP. A change that lifts fp32 mAP by 2 points but
