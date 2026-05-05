@@ -253,7 +253,9 @@ def submit_aihub_profile(traced_model, input_shape: tuple[int, ...],
 
     options = f"--target_runtime {target_runtime}"
     if quantize:
-        options += " --quantize_full_type w8a8"
+        # AI Hub vocab: int8 = weights+activations 8-bit. Other valid values:
+        # int16, float16, w8a16, w4a8, w4a16. Agent can override via extra_options.
+        options += " --quantize_full_type int8"
     if extra_options:
         options += " " + extra_options
 
@@ -285,12 +287,31 @@ def submit_aihub_profile(traced_model, input_shape: tuple[int, ...],
     metrics["latency_ms_p99"] = metrics["latency_ms_p50"]  # AI Hub returns single estimate
     peak = summary.get("inference_memory_peak_range", [0, 0])
     metrics["peak_mem_mb"] = peak[1] / (1024 * 1024)
-    metrics["size_mb"] = summary.get("compiled_model_size_bytes", 0) / 1e6
     metrics["npu_layers"] = sum(1 for l in detail if l.get("compute_unit") == "NPU")
     metrics["cpu_fallback_ops"] = sum(1 for l in detail if l.get("compute_unit") == "CPU")
     metrics["gpu_layers"] = sum(1 for l in detail if l.get("compute_unit") == "GPU")
     metrics["target_model"] = target_model
+    # Real on-disk size of the compiled artifact.
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            artifact = target_model.download(filename=str(Path(td) / "compiled.bin"))
+            metrics["size_mb"] = os.path.getsize(artifact) / 1e6
+    except Exception as e:
+        metrics["size_mb"] = 0.0
+        metrics["size_error"] = repr(e)
     return metrics
+
+
+def submit_aihub_inference(target_model, inputs: dict, device_name: str = AIHUB_DEVICE_NAME) -> dict:
+    """Run on-device inference for a batch of inputs. Returns dict of {output_name: list[np.ndarray]}.
+
+    `inputs` shape: {input_name: list[np.ndarray]} matching the compile job input spec.
+    """
+    import qai_hub as hub
+    dev = hub.Device(device_name)
+    job = hub.submit_inference_job(model=target_model, inputs=inputs, device=dev)
+    output = job.download_output_data()
+    return output
 
 
 # ----------------------------------------------------------------------------

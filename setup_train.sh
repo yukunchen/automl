@@ -56,8 +56,8 @@ if [ ! -d .venv-deploy ]; then
 fi
 # shellcheck disable=SC1091
 source .venv-deploy/bin/activate
-uv pip install --quiet --index-url "$PIP_INDEX" qai-hub torch torchvision onnx onnxruntime
-python -c "import qai_hub, torch, onnx; print('deploy venv ok, qai_hub', qai_hub.__version__)"
+uv pip install --quiet --index-url "$PIP_INDEX" qai-hub torch torchvision onnx onnxruntime pycocotools numpy
+python -c "import qai_hub, torch, onnx, pycocotools; print('deploy venv ok, qai_hub', qai_hub.__version__)"
 deactivate
 
 echo "[6/6] dataset cache dir"
