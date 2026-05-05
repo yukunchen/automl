@@ -28,7 +28,7 @@ import student
 
 DEPLOY_METRICS_PATH = Path("metrics_deploy.json")
 ON_DEVICE_EVAL_IMAGES = 200  # AGENT: bump up if AI Hub budget allows
-CALIBRATION_IMAGES = 64      # use real val images for PTQ calibration
+CALIBRATION_IMAGES = 256     # bumped from 64; more calib data closes quant gap further
 
 
 # ----------------------------------------------------------------------------
