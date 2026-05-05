@@ -5,3 +5,4 @@ exp2	0.1179	0.1727	0.1179	1.67	6.97	9.7	true	0	keep	bump training: 2000->5000 im
 exp3	0.1370	0.1740	0.1370	1.66	6.97	9.4	true	0	keep	real-image PTQ calibration (64 val imgs) closes another 16% of quant gap
 exp4	0.1354	0.1661	0.1354	1.67	6.97	10.0	true	0	discard	lower teacher pseudo-label threshold 0.5->0.3: too much teacher noise hurts fp32
 exp5	0.1260	0.1710	0.1260	1.66	6.97	10.4	true	0	discard	mix GT + teacher pseudo-labels: duplicate signal hurts quant
+40994f0	0.1924	0.2380	0.1924	1.66	6.97	9.6	true	0	keep	PROBE win: NUM_EPOCHS=0 — pretrained ssdlite > all our fine-tuned versions
