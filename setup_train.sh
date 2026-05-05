@@ -8,13 +8,25 @@
 #   .venv-deploy   - deployment stack (Python 3.11, qai-hub + onnx)
 
 set -euo pipefail
+export LANG=C
+
+# AutoDL ships PyTorch inside a conda env that isn't active in non-interactive
+# shells. Source it if present.
+if [ -f /root/miniconda3/etc/profile.d/conda.sh ]; then
+    # shellcheck disable=SC1091
+    source /root/miniconda3/etc/profile.d/conda.sh
+    conda activate base
+fi
+
+PY=$(command -v python || command -v python3)
+echo "using python: $PY"
 
 echo "[1/6] sanity-checking GPU + driver"
 nvidia-smi | head -n 5
-python3 -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+"$PY" -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 
 echo "[2/6] BF16 + CUDA matmul smoke test"
-python3 -c "import torch; x=torch.randn(1024,1024,device='cuda',dtype=torch.bfloat16); y=(x@x).sum().item(); print(f'bf16 matmul ok, sum={y:.2f}')"
+"$PY" -c "import torch; x=torch.randn(1024,1024,device='cuda',dtype=torch.bfloat16); y=(x@x).sum().item(); print(f'bf16 matmul ok, sum={y:.2f}')"
 
 echo "[3/6] installing uv (if missing)"
 if ! command -v uv >/dev/null 2>&1; then
@@ -25,7 +37,7 @@ uv --version
 
 echo "[4/6] training venv (.venv-train, system Python, uses preinstalled torch)"
 if [ ! -d .venv-train ]; then
-    python3 -m venv --system-site-packages .venv-train
+    "$PY" -m venv --system-site-packages .venv-train
 fi
 # shellcheck disable=SC1091
 source .venv-train/bin/activate
