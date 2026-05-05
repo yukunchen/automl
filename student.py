@@ -39,9 +39,9 @@ INPUT_SIZE = 320
 
 # AGENT: tune.
 NUM_TRAIN_IMAGES = 5000
-NUM_EPOCHS = 0               # PROBE: pretrained ssdlite is already 21.3 mAP — does ANY training help?
+NUM_EPOCHS = 1               # 1 epoch at very low LR — gentle nudge from pretrained
 BATCH_SIZE = 8
-LR = 5e-4
+LR = 1e-5                    # 50x lower than before — preserve pretrained features
 EVAL_MAX_IMAGES = 500        # validate on a subset for speed; agent can raise
 
 
