@@ -1,403 +1,373 @@
-"""
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+"""Frozen utilities for the autoresearch-cv detection loop. DO NOT MODIFY.
+
+Contract (program.md):
+- COCO data loading
+- Teacher model loading (RetinaNet ResNet50 FPN v2)
+- mAP evaluator (pycocotools)
+- AI Hub submit + parse helper
+- Hard-constraint checker
+- Standard summary printer
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
-
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+    python prepare.py --download         # ~1.2GB: val2017 + annotations
+    python prepare.py --download --full  # ~19GB: also train2017
 """
 
-import os
-import sys
-import time
-import math
+from __future__ import annotations
+
 import argparse
-import pickle
-from multiprocessing import Pool
+import json
+import math
+import os
+import tempfile
+import urllib.request
+import zipfile
+from pathlib import Path
+from typing import Iterable
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
 import torch
+import torchvision
+from torch.utils.data import DataLoader, Dataset
+from torchvision.models.detection import (
+    RetinaNet_ResNet50_FPN_V2_Weights,
+    retinanet_resnet50_fpn_v2,
+)
 
-def verify_macos_env():
-    import sys
-    if sys.platform != "darwin":
-        raise RuntimeError(f"This script requires macOS with Metal. Detected platform: {sys.platform}")
-    if not torch.backends.mps.is_available():
-        raise RuntimeError("MPS (Metal Performance Shaders) is not available. Ensure you are running on Apple Silicon with a compatible PyTorch build.")
-    print("Environment verified: macOS detected with Metal (MPS) hardware acceleration available.")
-    print()
+# ----------------------------------------------------------------------------
+# Constants
+# ----------------------------------------------------------------------------
 
-verify_macos_env()
+CACHE_DIR = Path(os.environ.get("AUTORESEARCH_CV_CACHE", "~/.cache/autoresearch-cv")).expanduser()
+COCO_DIR = CACHE_DIR / "coco"
+TEACHER_PATH = CACHE_DIR / "teacher.pt"
 
-# ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
-# ---------------------------------------------------------------------------
+# Hard constraints (program.md). Out of scope for the agent to change.
+HARD_CONSTRAINTS = {
+    "latency_ms": 30.0,
+    "size_mb": 10.0,
+    "peak_mem_mb": 200.0,
+}
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
-
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
-
-# ---------------------------------------------------------------------------
-# Data download
-# ---------------------------------------------------------------------------
-
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+# AI Hub target — Snapdragon 8 Gen 1 (SM8450).
+AIHUB_DEVICE_NAME = "Samsung Galaxy S22 5G"
+AIHUB_TARGET_RUNTIME = "qnn_context_binary"
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
+# ----------------------------------------------------------------------------
+# Device + seeding
+# ----------------------------------------------------------------------------
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
+def device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def seed_all(seed: int = 0) -> None:
+    import random
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+# ----------------------------------------------------------------------------
+# COCO download
+# ----------------------------------------------------------------------------
+
+_COCO_URLS = {
+    "val2017": "http://images.cocodataset.org/zips/val2017.zip",
+    "train2017": "http://images.cocodataset.org/zips/train2017.zip",
+    "annotations": "http://images.cocodataset.org/annotations/annotations_trainval2017.zip",
+}
+
+
+def _download(url: str, dest: Path) -> None:
+    if dest.exists():
         return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    print(f"downloading {url} -> {dest}", flush=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    urllib.request.urlretrieve(url, tmp)
+    tmp.rename(dest)
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
-
-
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
+def _unzip(zip_path: Path, dest_dir: Path, marker_subdir: str) -> None:
+    if (dest_dir / marker_subdir).exists():
         return
-
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
-
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
-
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
-
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
-    )
-
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
-
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
-
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
-
-# ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
-# ---------------------------------------------------------------------------
-
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
+    print(f"unzipping {zip_path} -> {dest_dir}", flush=True)
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(dest_dir)
 
 
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+def download_coco(splits: Iterable[str] = ("val2017", "annotations")) -> None:
+    """Idempotent."""
+    COCO_DIR.mkdir(parents=True, exist_ok=True)
+    zips_dir = COCO_DIR / "_zips"
+    zips_dir.mkdir(exist_ok=True)
+    for split in splits:
+        url = _COCO_URLS[split]
+        _download(url, zips_dir / Path(url).name)
+    for split in splits:
+        zpath = zips_dir / Path(_COCO_URLS[split]).name
+        marker = "annotations" if split == "annotations" else split
+        _unzip(zpath, COCO_DIR, marker)
 
 
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
+# ----------------------------------------------------------------------------
+# Dataset
+# ----------------------------------------------------------------------------
 
+class CocoDetectionTV(Dataset):
+    """torchvision CocoDetection wrapper that emits {boxes,labels} dicts in
+    xyxy format at original image scale, ready for torchvision detection models.
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+    Returns: (image_tensor[3,H,W] in [0,1], target_dict, image_id)
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
+    def __init__(self, img_dir: Path, ann_file: Path):
+        from torchvision.datasets import CocoDetection
+        self._inner = CocoDetection(str(img_dir), str(ann_file))
+        self.coco = self._inner.coco
+        self.image_ids = list(self._inner.ids)
 
-    # Detect device
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    def __len__(self) -> int:
+        return len(self._inner)
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=(device=="cuda"))
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+    def __getitem__(self, idx: int):
+        img, anns = self._inner[idx]
+        image_id = self._inner.ids[idx]
+        boxes, labels = [], []
+        for a in anns:
+            x, y, w, h = a["bbox"]
+            if w <= 0 or h <= 0:
+                continue
+            boxes.append([x, y, x + w, y + h])
+            labels.append(a["category_id"])
+        boxes_t = torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros((0, 4))
+        labels_t = (torch.tensor(labels, dtype=torch.int64) if labels
+                    else torch.zeros((0,), dtype=torch.int64))
+        img_t = torchvision.transforms.functional.to_tensor(img)
+        target = {"boxes": boxes_t, "labels": labels_t, "image_id": torch.tensor([image_id])}
+        return img_t, target, image_id
 
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
 
-                remaining = row_capacity - pos
+def coco_collate(batch):
+    imgs, targets, ids = zip(*batch)
+    return list(imgs), list(targets), list(ids)
 
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
 
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
+def load_coco_val() -> CocoDetectionTV:
+    return CocoDetectionTV(COCO_DIR / "val2017", COCO_DIR / "annotations/instances_val2017.json")
 
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
 
-# ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
-# ---------------------------------------------------------------------------
+def load_coco_train() -> CocoDetectionTV:
+    train_dir = COCO_DIR / "train2017"
+    if not train_dir.exists():
+        raise FileNotFoundError(
+            f"{train_dir} not found. Run `python prepare.py --download --full` first."
+        )
+    return CocoDetectionTV(train_dir, COCO_DIR / "annotations/instances_train2017.json")
+
+
+# ----------------------------------------------------------------------------
+# Teacher
+# ----------------------------------------------------------------------------
+
+def load_teacher() -> torch.nn.Module:
+    """RetinaNet ResNet50 FPN v2, COCO-pretrained (~41.5 mAP). Eval, frozen."""
+    weights = RetinaNet_ResNet50_FPN_V2_Weights.COCO_V1
+    model = retinanet_resnet50_fpn_v2(weights=weights, score_thresh=0.05).eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model
+
+
+# ----------------------------------------------------------------------------
+# mAP evaluator
+# ----------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
-    """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    device = next(model.parameters()).device
-    token_bytes = get_token_bytes(device=device)
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+def evaluate_map(model: torch.nn.Module, dataset: CocoDetectionTV,
+                 batch_size: int = 4, max_images: int | None = None,
+                 dev: torch.device | None = None) -> tuple[float, float]:
+    """COCO mAP via pycocotools. Returns (mAP@[.5:.95], mAP@.5)."""
+    from pycocotools.cocoeval import COCOeval
+    dev = dev or device()
+    model = model.to(dev).eval()
+    indices = list(range(len(dataset)))
+    if max_images is not None:
+        indices = indices[:max_images]
+    subset = torch.utils.data.Subset(dataset, indices)
+    loader = DataLoader(subset, batch_size=batch_size, shuffle=False,
+                        num_workers=2, collate_fn=coco_collate)
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+    results = []
+    seen_image_ids = []
+    for imgs, _targets, ids in loader:
+        imgs_dev = [im.to(dev) for im in imgs]
+        preds = model(imgs_dev)
+        for img_id, p in zip(ids, preds):
+            seen_image_ids.append(int(img_id))
+            boxes = p["boxes"].cpu().numpy()
+            scores = p["scores"].cpu().numpy()
+            labels = p["labels"].cpu().numpy()
+            for b, s, lbl in zip(boxes, scores, labels):
+                x1, y1, x2, y2 = b.tolist()
+                results.append({
+                    "image_id": int(img_id),
+                    "category_id": int(lbl),
+                    "bbox": [x1, y1, x2 - x1, y2 - y1],
+                    "score": float(s),
+                })
+
+    if not results:
+        return 0.0, 0.0
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(results, f)
+        pred_path = f.name
+    try:
+        coco_dt = dataset.coco.loadRes(pred_path)
+        ev = COCOeval(dataset.coco, coco_dt, "bbox")
+        ev.params.imgIds = seen_image_ids
+        ev.evaluate(); ev.accumulate(); ev.summarize()
+        return float(ev.stats[0]), float(ev.stats[1])
+    finally:
+        os.unlink(pred_path)
+
+
+# ----------------------------------------------------------------------------
+# AI Hub helper
+# ----------------------------------------------------------------------------
+
+def submit_aihub_profile(traced_model, input_shape: tuple[int, ...],
+                          quantize: bool = False, calibration_data=None,
+                          device_name: str = AIHUB_DEVICE_NAME,
+                          target_runtime: str = AIHUB_TARGET_RUNTIME,
+                          extra_options: str = "") -> dict:
+    """Compile + profile on a real Snapdragon device. Returns metrics dict.
+
+    Keys: latency_ms_p50, latency_ms_p99, peak_mem_mb, size_mb,
+          npu_layers, cpu_fallback_ops, gpu_layers, qnn_export_ok,
+          compile_url, profile_url, target_model.
+    """
+    import qai_hub as hub
+
+    options = f"--target_runtime {target_runtime}"
+    if quantize:
+        options += " --quantize_full_type w8a8"
+    if extra_options:
+        options += " " + extra_options
+
+    dev = hub.Device(device_name)
+    metrics: dict = {"qnn_export_ok": False}
+
+    compile_kwargs = dict(model=traced_model, device=dev,
+                          input_specs={"image": input_shape}, options=options)
+    if quantize and calibration_data is not None:
+        compile_kwargs["calibration_data"] = calibration_data
+
+    cjob = hub.submit_compile_job(**compile_kwargs)
+    metrics["compile_url"] = cjob.url
+    target_model = cjob.get_target_model()
+    if target_model is None:
+        return metrics
+    metrics["qnn_export_ok"] = True
+
+    pjob = hub.submit_profile_job(model=target_model, device=dev)
+    metrics["profile_url"] = pjob.url
+    profile = pjob.download_profile()
+    if profile is None:
+        return metrics
+
+    summary = profile.get("execution_summary", {})
+    detail = profile.get("execution_detail", [])
+
+    metrics["latency_ms_p50"] = summary.get("estimated_inference_time", 0) / 1000.0
+    metrics["latency_ms_p99"] = metrics["latency_ms_p50"]  # AI Hub returns single estimate
+    peak = summary.get("inference_memory_peak_range", [0, 0])
+    metrics["peak_mem_mb"] = peak[1] / (1024 * 1024)
+    metrics["size_mb"] = summary.get("compiled_model_size_bytes", 0) / 1e6
+    metrics["npu_layers"] = sum(1 for l in detail if l.get("compute_unit") == "NPU")
+    metrics["cpu_fallback_ops"] = sum(1 for l in detail if l.get("compute_unit") == "CPU")
+    metrics["gpu_layers"] = sum(1 for l in detail if l.get("compute_unit") == "GPU")
+    metrics["target_model"] = target_model
+    return metrics
+
+
+# ----------------------------------------------------------------------------
+# Constraint checker
+# ----------------------------------------------------------------------------
+
+def check_constraints(metrics: dict) -> tuple[float, str]:
+    """Return (score, reason). score = quantized_map if all hard constraints pass, else -inf."""
+    if not metrics.get("qnn_export_ok", False):
+        return float("-inf"), "qnn_export_failed"
+    lat = metrics.get("latency_ms_p50", math.inf)
+    if lat > HARD_CONSTRAINTS["latency_ms"]:
+        return float("-inf"), f"latency {lat:.1f}ms > {HARD_CONSTRAINTS['latency_ms']}ms"
+    sz = metrics.get("size_mb", math.inf)
+    if sz > HARD_CONSTRAINTS["size_mb"]:
+        return float("-inf"), f"size {sz:.1f}MB > {HARD_CONSTRAINTS['size_mb']}MB"
+    mem = metrics.get("peak_mem_mb", math.inf)
+    if mem > HARD_CONSTRAINTS["peak_mem_mb"]:
+        return float("-inf"), f"peak_mem {mem:.0f}MB > {HARD_CONSTRAINTS['peak_mem_mb']}MB"
+    cpu_fb = metrics.get("cpu_fallback_ops", 0)
+    if cpu_fb > 0:
+        return float("-inf"), f"{cpu_fb} CPU fallback ops"
+    return float(metrics.get("quantized_map", 0.0)), "ok"
+
+
+# ----------------------------------------------------------------------------
+# Summary printer
+# ----------------------------------------------------------------------------
+
+_SUMMARY_KEYS = [
+    "fp32_map", "fp32_map50",
+    "quantized_map",
+    "latency_ms_p50", "latency_ms_p99",
+    "size_mb", "peak_mem_mb",
+    "qnn_export_ok", "cpu_fallback_ops",
+    "score",
+    "training_seconds", "deploy_seconds",
+]
+
+def print_summary(metrics: dict) -> None:
+    print("---")
+    for k in _SUMMARY_KEYS:
+        v = metrics.get(k, "n/a")
+        if isinstance(v, bool):
+            print(f"{k+':':<20}{'true' if v else 'false'}")
+        elif isinstance(v, float):
+            print(f"{k+':':<20}-inf" if v == float("-inf") else f"{k+':':<20}{v:.4f}")
+        else:
+            print(f"{k+':':<20}{v}")
+    print("---")
+
+
+# ----------------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--download", action="store_true", help="Download COCO val + annotations.")
+    ap.add_argument("--full", action="store_true", help="Also download COCO train2017 (~18GB).")
+    ap.add_argument("--cache-teacher", action="store_true", help="Force-cache teacher weights.")
+    args = ap.parse_args()
+
+    if args.download:
+        splits = ["val2017", "annotations"]
+        if args.full:
+            splits.append("train2017")
+        download_coco(splits)
+        print(f"COCO ready at {COCO_DIR}")
+    if args.cache_teacher:
+        m = load_teacher()
+        TEACHER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(m.state_dict(), TEACHER_PATH)
+        print(f"teacher cached at {TEACHER_PATH}")
+    if not (args.download or args.cache_teacher):
+        print("Nothing to do. Try --download.")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
-    args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
-
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
-
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    main()

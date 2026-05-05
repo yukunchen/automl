@@ -1,18 +1,20 @@
 [project]
-name = "autoresearch"
+name = "autoresearch-cv"
 version = "0.1.0"
-description = "Autonomous pretraining research swarm"
+description = "Autonomous CV detection distillation: PC -> mobile (Snapdragon 8 Gen 1)"
 readme = "README.md"
 requires-python = ">=3.10"
+# Note: actual dependency versions are pinned per-venv by setup_train.sh.
+# - .venv-train uses the AutoDL preinstalled torch 2.7.0+cu128 via system-site-packages
+# - .venv-deploy installs torch 2.x + qai-hub independently
 dependencies = [
-    "matplotlib>=3.10.8",
-    "numpy>=2.2.6",
-    "pandas>=2.3.3",
-    "pyarrow>=21.0.0",
-    "requests>=2.32.0",
-    "rustbpe>=0.1.0",
-    "tiktoken>=0.11.0",
-    "torch==2.6.0",
+    "torch",
+    "torchvision",
+    "pycocotools",
+    "numpy",
+    "pillow",
+    "tqdm",
 ]
 
-
+[project.optional-dependencies]
+deploy = ["qai-hub", "onnx", "onnxruntime"]
