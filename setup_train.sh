@@ -47,12 +47,16 @@ python -c "import torch, timm, pycocotools; print('train venv ok')"
 deactivate
 
 echo "[5/6] deploy venv (.venv-deploy, Python 3.11 via uv, qai-hub stack)"
+# Use Tsinghua mirror for China-hosted boxes; harmless elsewhere.
+# Cache wheels on the data disk (system disk on AutoDL is only ~30GB).
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$PWD/.uv-cache}"
+PIP_INDEX="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 if [ ! -d .venv-deploy ]; then
     uv venv --python 3.11 .venv-deploy
 fi
 # shellcheck disable=SC1091
 source .venv-deploy/bin/activate
-uv pip install --quiet qai-hub torch torchvision onnx onnxruntime
+uv pip install --quiet --index-url "$PIP_INDEX" qai-hub torch torchvision onnx onnxruntime
 python -c "import qai_hub, torch, onnx; print('deploy venv ok, qai_hub', qai_hub.__version__)"
 deactivate
 
