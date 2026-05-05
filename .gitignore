@@ -18,3 +18,8 @@ AGENTS.md
 
 # Experimental code/artifacts
 dev/
+.env.local
+*.pt
+wheelhouse/
+run.log
+__pycache__/

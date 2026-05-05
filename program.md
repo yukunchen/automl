@@ -1,114 +1,236 @@
-# autoresearch
+# autoresearch-cv (detection · PC→mobile distillation)
 
-This is an experiment to have the LLM do its own research.
+This is an experiment to have an LLM agent autonomously distill a PC-grade
+object detector into a mobile-deployable student, targeting Snapdragon 8
+Gen 1 class hardware.
 
 ## Setup
 
 To set up a new experiment, work with the user to:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+1. **Agree on a run tag**: propose a tag based on today's date (e.g.
+   `cv-may5`). The branch `autoresearch/<tag>` must not already exist.
+2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current
+   master.
+3. **Read the in-scope files**:
+   - `README.md` — repo context.
+   - `prepare.py` — frozen: dataset loader, teacher model loader, mAP
+     evaluator, on-device benchmark client. Do not modify.
+   - `student.py` — the student architecture, distillation loss, training
+     loop. **You modify this.**
+   - `deploy.py` — quantization, ONNX→QNN export, on-device benchmark
+     submission. **You modify this.**
+4. **Verify resources exist**:
+   - `~/.cache/autoresearch-cv/coco/` (or chosen dataset) populated.
+   - Teacher checkpoint at `~/.cache/autoresearch-cv/teacher.pt`.
+   - `QAI_HUB_API_TOKEN` env var set (Qualcomm AI Hub for remote real-device
+     benchmark on SD8 Gen 1). If not, tell the human.
+5. **Initialize results.tsv**: create with header row only.
+6. **Confirm and go**.
 
-Once you get confirmation, kick off the experimentation.
+Once you get confirmation, kick off experimentation.
+
+## The problem
+
+- **Teacher**: a PC-grade detector running on RTX 4090 (e.g. DINO / YOLOv8-X
+  / RT-DETR). Frozen. Defines the upper bound and provides soft labels +
+  feature maps.
+- **Student**: must run on Snapdragon 8 Gen 1 class NPU (Hexagon).
+- **Dataset**: COCO val2017 (or the dataset specified in `prepare.py`) —
+  evaluated with standard mAP@[.5:.95].
+
+**Hard constraints (any violation → score = -inf, discard the run):**
+
+| Constraint | Budget |
+|---|---|
+| Single-image latency on SD8 Gen 1 NPU | ≤ 30 ms |
+| Quantized model size | ≤ 10 MB |
+| Peak runtime memory | ≤ 200 MB |
+| Must export to QNN successfully | required |
+| Must benchmark green on AI Hub | required |
+
+**Soft objective (the score):**
+
+```
+score = mAP_quantized   if all hard constraints pass
+        -inf            otherwise
+```
+
+We use the **quantized, on-device** mAP as the metric — not the FP32 PyTorch
+mAP. This is the only number that matters for shipping. Quantization gap
+gets attributed to the experiment that introduced it.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+Each experiment runs end-to-end:
+
+```
+uv run student.py > run.log 2>&1     # train & distill (typically 30-90 min)
+uv run deploy.py  >> run.log 2>&1    # quantize, export to QNN, benchmark on AI Hub
+```
+
+`deploy.py` submits the model to **Qualcomm AI Hub** which runs it on a real
+SD8 Gen 1 device and returns latency + per-layer profile. No physical
+hardware needed locally.
 
 **What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+- Modify `student.py` — student architecture (backbone, neck, head),
+  distillation method (logit KD, feature KD, attention transfer, relation
+  KD, on-policy), loss weights, temperature, optimizer, schedule, augment.
+- Modify `deploy.py` — quantization scheme (PTQ vs QAT, INT8/INT4,
+  per-channel/per-tensor, mixed precision per layer), calibration set size,
+  operator fusion config, QNN graph optimization flags.
 
 **What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+- Modify `prepare.py`. Frozen. Contains: data loader, teacher loader, mAP
+  evaluator, AI Hub client, hard-constraint checker.
+- Add new pip dependencies.
+- Change the metric or the hard-constraint budgets.
+- Use synthetic test data or fake-quantize when reporting a score — only
+  real on-device numbers count.
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+## Mobile-friendly architecture rules
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
+The Hexagon NPU is fast on a narrow set of ops. Stay inside the lane:
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
+**Prefer**: depthwise-separable conv, 3×3 / 1×1 conv, ReLU/ReLU6, BN (fold
+into conv), residual add, static shapes, NHWC layout, INT8.
 
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+**Avoid**: GroupNorm/LayerNorm in conv stages (slow), large kernels (>5),
+dilated conv with large rates, dynamic shapes, fancy attention with large
+softmax, ops AI Hub flags as "CPU fallback" (kills latency).
+
+If a layer falls back to CPU on the device profile, treat it as a bug and
+fix it.
 
 ## Output format
 
-Once the script finishes it prints a summary like this:
+`student.py` prints a training summary; `deploy.py` prints the deployment
+summary. The combined log will contain:
 
 ```
 ---
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
+fp32_map:           0.428
+fp32_map50:         0.612
+quantized_map:      0.401
+latency_ms_p50:     22.4
+latency_ms_p99:     27.1
+size_mb:            8.7
+peak_mem_mb:        174
+qnn_export_ok:      true
+cpu_fallback_ops:   0
+score:              0.401
+training_seconds:   3120
+deploy_seconds:     180
+---
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+Extract with:
+```
+grep -E "^(score|quantized_map|latency_ms_p50|size_mb|peak_mem_mb|qnn_export_ok|cpu_fallback_ops):" run.log
+```
 
-```
-grep "^val_bpb:" run.log
-```
+If `score: -inf`, identify which constraint failed from the other lines.
 
 ## Logging results
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
-
-The TSV has a header row and 5 columns:
+Append to `results.tsv` (tab-separated). Header:
 
 ```
-commit	val_bpb	memory_gb	status	description
+commit	score	fp32_map	q_map	lat_ms	size_mb	mem_mb	qnn_ok	cpu_fb	status	description
 ```
 
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+1. git commit (short, 7 chars)
+2. score (quantized_map if pass, else -inf)
+3. fp32 mAP (PyTorch, pre-quant)
+4. quantized mAP (on-device)
+5. p50 latency ms
+6. size MB
+7. peak memory MB
+8. qnn export ok (true/false)
+9. cpu fallback op count
+10. status: `keep`, `discard`, `crash`
+11. short description
 
 Example:
 
 ```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+commit	score	fp32_map	q_map	lat_ms	size_mb	mem_mb	qnn_ok	cpu_fb	status	description
+a1b2c3d	0.358	0.401	0.358	24.1	8.2	168	true	0	keep	baseline: MobileNetV3-S backbone + FCOS head, logit KD T=4
+b2c3d4e	-inf	0.412	0.000	-1.0	9.1	0	false	-	discard	add MobileViT block — QNN export fails on attention softmax shape
+c3d4e5f	0.371	0.408	0.371	26.8	8.9	172	true	0	keep	+ feature KD on neck P3/P4/P5
+d4e5f6g	-inf	0.395	0.342	34.2	8.4	165	true	2	discard	wider neck — latency budget blown, 2 ops on CPU
+e5f6g7h	0.379	0.405	0.379	23.0	7.1	160	true	0	keep	switch PTQ → QAT, recover 0.8 mAP
 ```
 
 ## The experiment loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+The experiment runs on a dedicated branch (e.g. `autoresearch/cv-may5`).
 
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+1. Check git state.
+2. Form a hypothesis. Modify `student.py` and/or `deploy.py`.
+3. `git commit -am "<short description>"`.
+4. Run training: `uv run student.py > run.log 2>&1`.
+5. If training crashed (`grep fp32_map run.log` empty), `tail -n 80 run.log`,
+   decide: fix-and-rerun if trivial, else log `crash` and revert.
+6. Run deployment: `uv run deploy.py >> run.log 2>&1`.
+7. Extract metrics with the grep above.
+8. If `score: -inf`, identify the failing constraint. Don't keep it.
+9. Append to `results.tsv`.
+10. If quantized_map improved over the current best (and constraints pass),
+    advance the branch (keep the commit).
+11. Else `git reset --hard HEAD~1` back to the last `keep`.
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+**Important**: the metric you optimize is **quantized_map under all hard
+constraints**, not fp32 mAP. A change that lifts fp32 mAP by 2 points but
+loses 3 points to quantization is a regression. Stay honest.
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+## Iteration strategy hints
 
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+Two coupled axes. Don't tune both at once — you'll never know which knob
+moved the number.
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
+**Outer loop (architecture + distillation, slow, hours-per-experiment):**
+- Backbone choice (MobileNetV3-S/L, EfficientNet-Lite, MobileOne, RepVGG-A0)
+- Neck (PAN, BiFPN-lite, simple FPN)
+- Head (FCOS-lite, NanoDet-style, YOLOX-tiny head)
+- Distillation: logit KD → + feature KD on neck → + relation KD → on-policy
+- Loss balance, temperature, schedule
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+**Inner loop (quantization & deployment, fast, minutes-per-experiment):**
+Given a fixed trained checkpoint, agent iterates on `deploy.py` only:
+- PTQ calibration set size, mix
+- Per-channel vs per-tensor weight quant
+- Activation quant scheme
+- Layers held at FP16 (typically detection head's regression branch)
+- QNN graph fusion flags
+
+Inner loop is cheap — exploit it. After a successful outer-loop training,
+spend 10-20 inner-loop iterations squeezing quantized_map before moving on.
+
+## Failure modes to watch
+
+1. **CPU fallback ops** — single unsupported op kills latency. `cpu_fb > 0`
+   means investigate immediately.
+2. **Quantization collapse** — fp32 mAP fine, quantized mAP near zero. Usually
+   activation outliers in detection head. Try QAT or hold that layer FP16.
+3. **Memory spike during NMS** — pre-NMS box count explodes on hard images.
+   Cap top-K before NMS.
+4. **Static shape violation** — anchor-free heads with variable output count
+   need padding to fixed shape for QNN.
+5. **Train/eval skew** — augmentation pipeline differs between PC train and
+   on-device eval. Match preprocessing exactly.
+
+## NEVER STOP
+
+Once the experiment loop has begun, do NOT pause to ask whether to continue.
+The human may be asleep. Run until manually stopped. If you run out of
+ideas: re-read recent `keep` rows for what's working, read teacher feature
+maps to see what student is missing, try combining two near-misses, try
+something more radical (different student family entirely). The loop runs
+until interrupted, period.
+
+A typical outer-loop experiment takes 30-90 min, an inner-loop one takes
+5-15 min, so expect ~10-30 experiments per overnight run.
