@@ -151,12 +151,9 @@ def main():
 
     # 2) Build the on-device quantized model and run inference
     print("tracing student for NPU...", flush=True)
-    # Need a checkpoint — we use pretrained directly (no training).
-    student_fp32_for_trace = student.build_student().eval()
-    payload = {"state_dict": student_fp32_for_trace.state_dict(), "input_size": INPUT_SIZE}
-    student.STUDENT_CKPT.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, student.STUDENT_CKPT)
-    traced, input_shape = deploy.trace_student(student.STUDENT_CKPT, INPUT_SIZE)
+    # Need a fresh host model in eval mode for tracing (deploy._BackbonePlusHead wraps it)
+    host_for_trace = student.build_student().eval()
+    traced, input_shape = deploy.trace_for_npu(host_for_trace, INPUT_SIZE)
 
     print("compiling on AI Hub (w8a16, 256-image calib)...", flush=True)
     # Build calibration set (last 256 of val)
