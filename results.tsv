@@ -7,3 +7,4 @@ exp4	0.1354	0.1661	0.1354	1.67	6.97	10.0	true	0	discard	lower teacher pseudo-lab
 exp5	0.1260	0.1710	0.1260	1.66	6.97	10.4	true	0	discard	mix GT + teacher pseudo-labels: duplicate signal hurts quant
 40994f0	0.1924	0.2380	0.1924	1.66	6.97	9.6	true	0	keep	PROBE win: NUM_EPOCHS=0 — pretrained ssdlite > all our fine-tuned versions
 b8e6380	0.1931	0.2380	0.1931	1.66	6.97	9.9	true	0	keep	calibration 64 -> 256 imgs (marginal +0.0007, calib effect saturated)
+776767d	0.1772	0.2326	0.1772	1.66	6.97	9.4	true	0	discard	gentle fine-tune LR=1e-5 1 epoch teacher pseudo: still hurts fp32 -0.005 and quant -0.016 (pseudo signal toxic at any LR)
