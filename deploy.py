@@ -190,11 +190,13 @@ def main() -> None:
     # quantize=True so prepare.py wires calibration_data into the compile job.
     # extra_options appends --quantize_full_type w8a16 after the default int8;
     # the AI Hub argparser takes the last occurrence.
-    print("submitting compile + profile (w8a16, real-data calibration)...", flush=True)
+    # PROBE: w4a16 — 4-bit weights, 16-bit activations. Size ~halved.
+    # If accuracy loss is small, opens room for a 2x bigger architecture.
+    print("submitting compile + profile (w4a16, real-data calibration)...", flush=True)
     hub_metrics = prepare.submit_aihub_profile(
         traced, input_shape,
         quantize=True, calibration_data=calibration_data,
-        extra_options="--quantize_full_type w8a16",
+        extra_options="--quantize_full_type w4a16",
     )
 
     if not hub_metrics.get("qnn_export_ok"):
