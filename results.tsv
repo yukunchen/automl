@@ -9,3 +9,4 @@ exp5	0.1260	0.1710	0.1260	1.66	6.97	10.4	true	0	discard	mix GT + teacher pseudo-
 b8e6380	0.1931	0.2380	0.1931	1.66	6.97	9.9	true	0	keep	calibration 64 -> 256 imgs (marginal +0.0007, calib effect saturated)
 776767d	0.1772	0.2326	0.1772	1.66	6.97	9.4	true	0	discard	gentle fine-tune LR=1e-5 1 epoch teacher pseudo: still hurts fp32 -0.005 and quant -0.016 (pseudo signal toxic at any LR)
 7178ee7	0.0001	0.2380	0.0001	1.66	3.50	9.6	true	0	discard	w4a16 PTQ — 4-bit weights collapse without QAT (would need training-aware quant)
+9b3c9d3	0.1774	0.2320	0.1774	1.67	6.97	10.5	true	0	discard	GT-only LR=1e-5 1 epoch — pretrained (trained on full train2017) beats any fine-tune we can do on 4500 val
