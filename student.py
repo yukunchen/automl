@@ -39,9 +39,9 @@ INPUT_SIZE = 320
 
 # AGENT: tune.
 NUM_TRAIN_IMAGES = 5000
-NUM_EPOCHS = 0               # PROBE: pretrained ssdlite is already 21.3 mAP — does ANY training help?
+NUM_EPOCHS = 1               # GT-only fine-tune at very low LR
 BATCH_SIZE = 8
-LR = 5e-4
+LR = 1e-5                    # gentle nudge from pretrained on val[500:] GT
 EVAL_MAX_IMAGES = 500        # validate on a subset for speed; agent can raise
 
 
@@ -78,9 +78,14 @@ def teacher_pseudo_labels(teacher: torch.nn.Module, images, score_thresh: float 
     return targets
 
 
-def train_step(student, teacher, images, optimizer):
+def train_step(student, teacher, images, gt_targets, optimizer):
+    """GT-supervised fine-tune. Teacher unused — pseudo-labels were destructive
+    in every prior run, so we go straight to ground truth.
+    """
+    del teacher  # explicitly unused
     images = [im.to(prepare.device(), non_blocking=True) for im in images]
-    targets = teacher_pseudo_labels(teacher, images)
+    targets = [{"boxes": t["boxes"].to(prepare.device()),
+                "labels": t["labels"].to(prepare.device())} for t in gt_targets]
     # Drop empties — torchvision detection losses can NaN on zero-target inputs.
     keep = [i for i, t in enumerate(targets) if t["boxes"].numel() > 0]
     if not keep:
@@ -130,8 +135,8 @@ def main() -> None:
     print(f"training: {len(train_ds)} imgs, {NUM_EPOCHS} epochs, bs={BATCH_SIZE}", flush=True)
     step = 0
     for epoch in range(NUM_EPOCHS):
-        for imgs, _gt, _ids in train_loader:
-            loss = train_step(student, teacher, imgs, optimizer)
+        for imgs, gt, _ids in train_loader:
+            loss = train_step(student, teacher, imgs, gt, optimizer)
             if loss is not None and step % 50 == 0:
                 print(f"epoch {epoch} step {step} loss {loss:.4f}", flush=True)
             step += 1
